@@ -11,12 +11,12 @@ from utils import VisDroneSequenceDataset, collate_fn
 
 
 # define gpu or cpu
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda")
 
 # hyperparameters
-num_epochs = 10
+num_epochs = 1
 learning_rate = 0.005
-max_seq_len = 100
+max_seq_len = 10
 
 # transformations
 transform = Compose(
@@ -83,14 +83,22 @@ class CNN_TCN(nn.Module):
                 frame_output.squeeze()
             )  # Squeeze to remove unnecessary dimensions
 
+        print(f"cnn_ouput shape: {cnn_output.shape}")  # Debugging
+
+        # convert cnn_output to tuple of tensors
+        tuple_cnn_output = tuple(cnn_output[:, i, :] for i in range(seq_len))
+
         cnn_out = torch.stack(
-            cnn_output, dim=1
+            tuple_cnn_output, dim=1
         )  # Stack the CNN outputs along the sequence dimension
 
         # Reshape for TCN
         cnn_out = cnn_out.permute(
             0, 2, 1
         )  # Change to (batch_size, features, seq_len) for TCN
+
+        # Ensure input and target tensors have the same size
+        target = target.unsqueeze(1).expand(-1, seq_len, -1)
 
         tcn_out = self.tcn(cnn_out)
 
@@ -224,19 +232,19 @@ def test_model(model, test_loader, criterion):
 
 # load data
 dataset_train = VisDroneSequenceDataset(
-    root_dir="../data/VisDrone2019-VID-train",
+    root_dir="C:\\Users\\Nelio\\Coding\\Personal\\AI-ML\\data\\VisDrone2019-VID-train",
     transform=transform,
     max_seq_len=max_seq_len,
 )
 
 dataset_val = VisDroneSequenceDataset(
-    root_dir="../data/VisDrone2019-VID-val",
+    root_dir="C:\\Users\\Nelio\\Coding\\Personal\\AI-ML\\data\\VisDrone2019-VID-val",
     transform=transform,
     max_seq_len=max_seq_len,
 )
 
 dataset_test = VisDroneSequenceDataset(
-    root_dir="../data/VisDrone2019-VID-test-dev",
+    root_dir="C:\\Users\\Nelio\\Coding\\Personal\\AI-ML\\data\\VisDrone2019-VID-test-dev",
     transform=transform,
     max_seq_len=max_seq_len,
 )
