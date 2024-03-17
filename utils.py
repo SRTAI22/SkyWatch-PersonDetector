@@ -55,7 +55,6 @@ class VisDroneSequenceDataset(Dataset):
 
         images = torch.stack(images)
 
-        # Example for loading annotations - adjust according to your needs
         annotation_path = self.annotations[idx]
         with open(annotation_path, "r") as file:
             annotations = file.readlines()
