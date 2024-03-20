@@ -7,16 +7,15 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 from torch.nn.utils import parametrizations
 import copy
-from utils import VisDroneSequenceDataset, collate_fn
+from utils import VisDroneSequenceDataset
 
 
 # define gpu or cpu
-device = torch.device("cuda")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # hyperparameters
-num_epochs = 1
+num_epochs = 10
 learning_rate = 0.005
-max_seq_len = 10
 
 # transformations
 transform = Compose(
@@ -28,89 +27,49 @@ transform = Compose(
 )
 
 
-# CNN-TCN Model
-class TCNBlock(nn.Module):
-    def __init__(
-        self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, dropout=0.2
-    ):
-        super(TCNBlock, self).__init__()
-        self.conv1 = parametrizations.weight_norm(
-            nn.Conv1d(
-                in_channels, out_channels, kernel_size, stride=stride, padding=padding
-            )
-        )
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        return self.dropout(self.relu(self.conv1(x)))
-
-
-class CNN_TCN(nn.Module):
-    def __init__(self, max_seq_len=None):
-        super(CNN_TCN, self).__init__()
-        self.max_seq_len = max_seq_len
+# CNN-LTSM Model
+class CNN_LSTM(nn.Module):
+    def __init__(self):
+        super(CNN_LSTM, self).__init__()
         self.cnn = models.resnet18(pretrained=True)
         self.cnn.fc = nn.Identity()  # Remove the final FC layer
-        self.tcn = nn.Sequential(
-            TCNBlock(512, 256),  # Match input size with CNN output size
-            TCNBlock(256, 128),
-            TCNBlock(128, 64),
-            TCNBlock(64, 32),
-            TCNBlock(32, 16),
-            TCNBlock(16, 8),
-            TCNBlock(8, 4),
-        )
-        self.classifier = nn.Linear(4, 4)  # Final classifier
+        self.lstm = nn.LSTM(
+            512, 256, batch_first=True
+        )  # Match input size with CNN output size
+        self.classifier = nn.Linear(256, 4)  # Final classifier
 
     def forward(self, x):
-        if isinstance(x, list):
-            print("List of tensors")  # Debugging
-            x = torch.stack(x)
-        # shape (C, H, W)
-        batch_size = len(x)
-        seq_len = self.max_seq_len
+        print(f"x shape:\n{x[0].shape}")
+        # Iterate through each sequence in the batch
+        outputs = []
+        for seq in x:
+            cnn_output = torch.zeros(
+                seq.shape[0], 512, device=device
+            )  # Per-sequence CNN output
 
-        cnn_output = torch.zeros(
-            batch_size, seq_len, 512, device=device
-        )  # Prepare tensor to store CNN outputs
+            # Iterate through each frame in the sequence
+            for i in range(seq.shape[0]):
+                frame = seq[i].unsqueeze(
+                    0
+                )  # Add a batch dimension for the single frame
+                # Ensure the frame has 3 channels
+                if frame.shape[1] != 3:
+                    frame = frame.repeat(1, 3, 1, 1)
+                print(f"frame shape:\n{frame.shape}")
+                frame_output = self.cnn(frame)
+                cnn_output[i, :] = frame_output.squeeze()
 
-        # Iterate through each sequence and each image within the sequence
-        for i in range(seq_len):
-            # Process each frame through CNN
-            frame_output = self.cnn(x[:, i, :, :, :])  # shape: [batch_size, C, H, W]
-            cnn_output[:, i, :] = (
-                frame_output.squeeze()
-            )  # Squeeze to remove unnecessary dimensions
+            # Reshape and pass through LSTM
+            cnn_out = cnn_output.unsqueeze(0)  # Add a batch dimension
+            lstm_out, _ = self.lstm(cnn_out)
+            out = self.classifier(lstm_out[-1, :, :])  # Output from last time step
 
-        print(f"cnn_ouput shape: {cnn_output.shape}")  # Debugging
-
-        # convert cnn_output to tuple of tensors
-        tuple_cnn_output = tuple(cnn_output[:, i, :] for i in range(seq_len))
-
-        cnn_out = torch.stack(
-            tuple_cnn_output, dim=1
-        )  # Stack the CNN outputs along the sequence dimension
-
-        # Reshape for TCN
-        cnn_out = cnn_out.permute(
-            0, 2, 1
-        )  # Change to (batch_size, features, seq_len) for TCN
-
-        # Ensure input and target tensors have the same size
-        target = target.unsqueeze(1).expand(-1, seq_len, -1)
-
-        tcn_out = self.tcn(cnn_out)
-
-        tcn_out = tcn_out[:, :, -1]  # Take the output from the last time step
-
-        out = self.classifier(tcn_out)
-
-        return out
+            outputs.append(out)
+        return torch.stack(outputs)
 
 
 # model
-model = CNN_TCN(max_seq_len=max_seq_len).to(device)
+model = CNN_LSTM().to(device)
 
 # Loss and optimiser
 mse = nn.MSELoss()
@@ -133,11 +92,13 @@ def train_model(
 
         # Training phase
         for images, annotations in train_loader:
-            images = [img.to(device) for img in images]  # List of tensors
+            images = [
+                img.to(device) for img_seq in images for img in img_seq
+            ]  # Send each tensor to the device
 
             optimizer.zero_grad()
 
-            outputs = model(images)  # Pass the list of tensors directly
+            outputs = model(images)  # Forward pass
             loss = 0
             for output, annotation in zip(outputs, annotations):
                 bboxes = []
@@ -164,7 +125,9 @@ def train_model(
         val_loss = 0.0
         with torch.no_grad():
             for images, annotations in val_loader:
-                images = [img.to(device) for img in images]
+                images = [
+                    img.to(device) for img_seq in images for img in img_seq
+                ]  # Send each tensor to the device
                 labels = []
                 for annotation in annotations:
                     bboxes = []
@@ -180,7 +143,7 @@ def train_model(
                             bboxes.append(bbox)
                     labels.append(bboxes)
 
-                outputs = [model([img]) for img in images]
+                outputs = [model(img_seq) for img_seq in images]
                 loss = 0
                 for output, label in zip(outputs, labels):
                     for bbox in label:
@@ -232,30 +195,29 @@ def test_model(model, test_loader, criterion):
 
 # load data
 dataset_train = VisDroneSequenceDataset(
-    root_dir="C:\\Users\\Nelio\\Coding\\Personal\\AI-ML\\data\\VisDrone2019-VID-train",
+    root_dir="../data/VisDrone2019-VID-train",
     transform=transform,
-    max_seq_len=max_seq_len,
 )
 
 dataset_val = VisDroneSequenceDataset(
-    root_dir="C:\\Users\\Nelio\\Coding\\Personal\\AI-ML\\data\\VisDrone2019-VID-val",
+    root_dir="../data/VisDrone2019-VID-val",
     transform=transform,
-    max_seq_len=max_seq_len,
 )
 
 dataset_test = VisDroneSequenceDataset(
-    root_dir="C:\\Users\\Nelio\\Coding\\Personal\\AI-ML\\data\\VisDrone2019-VID-test-dev",
+    root_dir="../data/VisDrone2019-VID-test-dev",
     transform=transform,
-    max_seq_len=max_seq_len,
 )
 
 # data loader
 train_loader = DataLoader(
-    dataset_train, batch_size=4, shuffle=True, collate_fn=collate_fn
+    dataset_train, batch_size=4, shuffle=False, collate_fn=dataset_train.collate_fn
 )
-val_loader = DataLoader(dataset_val, batch_size=4, shuffle=True, collate_fn=collate_fn)
+val_loader = DataLoader(
+    dataset_val, batch_size=4, shuffle=False, collate_fn=dataset_val.collate_fn
+)
 test_loader = DataLoader(
-    dataset_test, batch_size=4, shuffle=True, collate_fn=collate_fn
+    dataset_test, batch_size=4, shuffle=False, collate_fn=dataset_test.collate_fn
 )
 
 
